@@ -1,0 +1,21 @@
+diff --git a/mace/python/tools/converter_tool/tensorflow_converter.py b/mace/python/tools/converter_tool/tensorflow_converter.py
+index 0b3661b..ecd6bf2 100644
+--- a/mace/python/tools/converter_tool/tensorflow_converter.py
++++ b/mace/python/tools/converter_tool/tensorflow_converter.py
+@@ -286,6 +286,8 @@ class TensorflowConverter(base_converter.ConverterInterface):
+         self._skip_tensor = set()
+         self._output_shape = {}
+ 
++        self.add_shape_info(tf_graph_def)
++
+         print("Run transform_graph: %s" % TFTransformGraphOptions)
+         try:
+             print("output keys: ", option.output_nodes.keys())
+@@ -305,7 +307,6 @@ class TensorflowConverter(base_converter.ConverterInterface):
+         #     as_text=False
+         # )
+ 
+-        self.add_shape_info(transformed_graph_def)
+ 
+         with tf.Session() as session:
+             with session.graph.as_default() as graph:
