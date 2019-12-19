@@ -1,0 +1,13 @@
+diff --git a/tools/python/utils/device.py b/tools/python/utils/device.py
+index 908a0db..1c56837 100644
+--- a/tools/python/utils/device.py
++++ b/tools/python/utils/device.py
+@@ -251,7 +251,7 @@ class ArmLinuxDevice(Device):
+         execute("ssh %s mkdir -p %s" % (ip, install_dir))
+         execute("scp -r %s %s:%s" % (target.path, ip, install_dir))
+         for lib in target.libs:
+-            execute("scp -r %s:%s" % (lib, install_dir))
++            execute("scp -r %s %s:%s" % (lib, ip, install_dir))
+ 
+         target.path = "%s/%s" % (install_dir, os.path.basename(target.path))
+         target.libs = ["%s/%s" % (install_dir, os.path.basename(lib))
