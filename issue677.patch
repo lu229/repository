@@ -1,0 +1,186 @@
+commit 2ed51a73437326827557d9300c0a635c252d1164
+Author: luxuhui <luxuhui@xiaomi.com>
+Date:   Fri Sep 25 10:26:39 2020 +0800
+
+    feat: support Resize and Slice Op for ONNX
+    
+    N/A
+    
+    Signed-off-by: Luxuhui <luxuhui@xiaomi.com>
+
+diff --git a/mace/ops/arm/fp32/gemm.cc b/mace/ops/arm/fp32/gemm.cc
+index 123e3aa..2f6816d 100644
+--- a/mace/ops/arm/fp32/gemm.cc
++++ b/mace/ops/arm/fp32/gemm.cc
+@@ -1054,6 +1054,7 @@ MaceStatus Gemm<float>::Compute(const OpContext *context,
+       PadAlignSize(sizeof(float) * rows_padded * cols_padded);
+   // resize to the total size of lhs & rhs & output anyway,
+   // in case we do not cache const tensor for saving memory
++  scratch->Rewind();
+   MACE_RETURN_IF_ERROR(scratch->GrowSize(
+       packed_lhs_size + packed_rhs_size + packed_output_size));
+   float *packed_lhs_data =
+diff --git a/tools/python/transform/onnx_converter.py b/tools/python/transform/onnx_converter.py
+index ca384e5..07f4c77 100644
+--- a/tools/python/transform/onnx_converter.py
++++ b/tools/python/transform/onnx_converter.py
+@@ -157,6 +157,7 @@ OnnxSupportedOps = [
+     # 'ReduceSumSquare',
+     'Relu',
+     'ReplaceIndex',
++    'Resize',
+     'Reshape',
+     'Round',
+     'Scale',
+@@ -407,7 +408,8 @@ class OnnxConverter(base_converter.ConverterInterface):
+             OnnxOpType.TargetRMSNorm: self.convert_target_rms_norm,
+             OnnxOpType.Transpose.name: self.convert_transpose,
+             OnnxOpType.Unsqueeze.name: self.convert_unsqueeze,
+-            OnnxOpType.Upsample.name: self.convert_upsample
++            OnnxOpType.Upsample.name: self.convert_upsample,
++            OnnxOpType.Resize.name: self.convert_resize
+         }
+         self._option = option
+         self._mace_net_def = mace_pb2.NetDef()
+@@ -892,8 +894,13 @@ class OnnxConverter(base_converter.ConverterInterface):
+         #  convert clip to activation(ReLU or ReLUX)
+         #  so it can be fused into convolution.
+         is_relux = False
+-        if 'min' in node.attrs:
+-            min_value = node.attrs['min']
++        inputs_dims = len(node.inputs)
++        if 'min' in node.attrs or inputs_dims > 1:
++            if inputs_dims > 1:
++                min_value = self._consts[node.inputs[1]].float_data[0]
++                print("minva  ", min_value)
++            else:
++                min_value = node.attrs['min']
+             if min_value == 0:
+                 is_relux = True
+         if is_relux:
+@@ -902,8 +909,9 @@ class OnnxConverter(base_converter.ConverterInterface):
+ 
+             type_arg = op.arg.add()
+             type_arg.name = MaceKeyword.mace_activation_type_str
+-            if "max" in node.attrs:
+-                max_value = node.attrs["max"]
++            if inputs_dims > 1 or "max" in node.attrs:
++                max_value = self._consts[node.inputs[2]].float_data[0] \
++                        if inputs_dims > 1 else node.attrs["max"]
+                 type_arg.s = six.b(ActivationType.RELUX.name)
+                 alpha_arg = op.arg.add()
+                 alpha_arg.name = MaceKeyword.mace_activation_max_limit_str
+@@ -912,6 +920,8 @@ class OnnxConverter(base_converter.ConverterInterface):
+                 type_arg.s = six.b(ActivationType.RELU.name)
+         else:
+             self.convert_eltwise(node)
++        if inputs_dims > 1:
++            del op.input[1:]
+ 
+     def convert_eltwise(self, node):
+         op = self.convert_general_op(node)
+@@ -1092,8 +1102,8 @@ class OnnxConverter(base_converter.ConverterInterface):
+ 
+         scale_name = node.name + 'scale'
+         offset_name = node.name + 'offset'
+-        scale_value = ((1.0 / np.sqrt(
+-                    var_value + epsilon_value)) * gamma_value)
++        scale_value = \
++            ((1.0 / np.sqrt(var_value + epsilon_value)) * gamma_value)
+         offset_value = (-mean_value * scale_value) + beta_value
+         self.add_tensor(scale_name, scale_value.shape, mace_pb2.DT_FLOAT,
+                         scale_value)
+@@ -1139,8 +1149,8 @@ class OnnxConverter(base_converter.ConverterInterface):
+         trans_a = node.attrs['transA'] if 'transA' in node.attrs else 0
+         trans_b = node.attrs['transB'] if 'transB' in node.attrs else 0
+         is_fc = False
+-        if trans_a == 0 and trans_b == 1 and\
+-            node.inputs[0] in self._graph_shapes_dict and\
++        if trans_a == 0 and trans_b == 1 and \
++                node.inputs[0] in self._graph_shapes_dict and \
+                 node.inputs[1] in self._graph_shapes_dict and \
+                 node.inputs[1] in self._consts:
+             shape_a = self._graph_shapes_dict[node.inputs[0]]
+@@ -1347,21 +1357,36 @@ class OnnxConverter(base_converter.ConverterInterface):
+         op = self.convert_general_op(node)
+         op.type = MaceOp.Slice.name
+ 
+-        mace_check('starts' in node.attrs, "Attribute starts required!")
+-        mace_check('ends' in node.attrs, "Attribute ends required!")
+-        starts = node.attrs['starts']
+         starts_arg = op.arg.add()
+         starts_arg.name = 'starts'
+-        starts_arg.ints.extend(starts)
+-        ends = node.attrs['ends']
+         ends_arg = op.arg.add()
+         ends_arg.name = 'ends'
+-        ends_arg.ints.extend(ends)
+-        if 'axes' in node.attrs:
+-            axes = node.attrs['axes']
+-            axes_arg = op.arg.add()
+-            axes_arg.name = 'axes'
+-            axes_arg.ints.extend(axes)
++
++        if 'starts' in node.attrs:
++            mace_check('ends' in node.attrs, "Attribute ends required!")
++            starts = node.attrs['starts']
++            starts_arg.ints.extend(starts)
++            ends = node.attrs['ends']
++            ends_arg.ints.extend(ends)
++            if 'axes' in node.attrs:
++                axes = node.attrs['axes']
++                axes_arg = op.arg.add()
++                axes_arg.name = 'axes'
++                axes_arg.ints.extend(axes)
++        else:
++            mace_check(len(node.inputs) >= 3, "Input starts and ends required")
++            mace_check((node.inputs[1] in self._consts) and
++                       (node.inputs[2] in self._consts),
++                       "starts and ends should be const")
++            starts_tensor = self._consts[node.inputs[1]]
++            starts_arg.ints.extend(starts_tensor.int32_data)
++            ends_tensor = self._consts[node.inputs[2]]
++            ends_arg.ints.extend(ends_tensor.int32_data)
++            if len(node.inputs) >= 4:
++                axes_tensor = self._consts[node.inputs[3]]
++                axes_arg = op.arg.add()
++                axes_arg.name = 'axes'
++                axes_arg.ints.extend(axes_tensor.int32_data)
+ 
+     def convert_softmax(self, node):
+         op = self.convert_general_op(node)
+@@ -1531,3 +1556,34 @@ class OnnxConverter(base_converter.ConverterInterface):
+         align_corners_arg = op.arg.add()
+         align_corners_arg.name = MaceKeyword.mace_align_corners_str
+         align_corners_arg.i = node.attrs.get('align_corners', 0)
++
++    def convert_resize(self, node):
++        op = self.convert_general_op(node)
++        if node.attrs['mode'] == 'nearest':
++            op.type = MaceOp.ResizeNearestNeighbor.name
++        else:
++            op.type = MaceOp.ResizeBilinear.name
++
++        scale_tensor = self._consts[node.inputs[2]]
++        if scale_tensor.dims[0] == 0:
++            mace_check(node.inputs[3] in self._consts,
++                       "Only support const input for `sizes` in Resize Op")
++            size_tensor = self._consts[node.inputs[3]]
++            size_arg = op.arg.add()
++            size_arg.name = MaceKeyword.mace_resize_size_str
++            size_array = \
++                [size_tensor.int32_data[-2], size_tensor.int32_data[-1]]
++            size_value = np.array(size_array, dtype=np.int32)
++            size_arg.ints.extend(size_value)
++        else:
++            height_scale_arg = op.arg.add()
++            height_scale_arg.name = MaceKeyword.mace_height_scale_str
++            width_scale_arg = op.arg.add()
++            width_scale_arg.name = MaceKeyword.mace_width_scale_str
++            height_scale_arg.f = scale_tensor.float_data[-2]
++            width_scale_arg.f = scale_tensor.float_data[-1]
++
++        align_corners_arg = op.arg.add()
++        align_corners_arg.name = MaceKeyword.mace_align_corners_str
++        align_corners_arg.i = node.attrs[
++            'coordinate_transformation_mode'] == 'align_corners'
