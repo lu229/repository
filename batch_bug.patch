@@ -1,0 +1,98 @@
+commit 5990445d90f52ffeff2435a41a17b9932e14efe8
+Author: luxuhui <luxuhui@xiaomi.com>
+Date:   Thu Apr 8 16:06:20 2021 +0800
+
+    fix: fix GPU perf problem on MTK and error in batch files tests
+    
+    N/A
+    
+    Signed-off-by: Luxuhui <luxuhui@xiaomi.com>
+
+diff --git a/mace/core/runtime/runtime_registry.cc b/mace/core/runtime/runtime_registry.cc
+index 90fa7ff..0d6dd45 100644
+--- a/mace/core/runtime/runtime_registry.cc
++++ b/mace/core/runtime/runtime_registry.cc
+@@ -58,8 +58,12 @@ std::unique_ptr<Runtime> RuntimeRegistry::CreateRuntime(
+     const RuntimeType runtime_type, const RuntimeSubType runtime_sub_type,
+     RuntimeContext *runtime_context) const {
+   const auto runtime_key = RuntimeKey(runtime_type, runtime_sub_type);
+-  MACE_CHECK(registry_.count(runtime_key) > 0, "runtime_type: ", runtime_type,
+-             ", runtime_sub_type: ", runtime_sub_type);
++  MACE_CHECK(registry_.count(runtime_key) > 0,
++             "Current MACE doesn't support the runtime type. runtime_type: ",
++             runtime_type, ", runtime_sub_type: ", runtime_sub_type,
++             ", perhaps you have specified A type runtime in yml file to"
++             " convert model but specified B type runtime in yml file to"
++             " run model");
+ 
+   const RuntimeCreator &creator = registry_.at(runtime_key);
+   return creator(runtime_context);
+diff --git a/mace/runtimes/opencl/core/opencl_executor.cc b/mace/runtimes/opencl/core/opencl_executor.cc
+index cef1624..e89a587 100644
+--- a/mace/runtimes/opencl/core/opencl_executor.cc
++++ b/mace/runtimes/opencl/core/opencl_executor.cc
+@@ -637,7 +637,7 @@ cl::Context &OpenclExecutor::context() { return *context_; }
+ 
+ cl::Device &OpenclExecutor::device() { return *device_; }
+ 
+-cl::CommandQueue &OpenclExecutor::command_queue() { return *command_queue_; }
++cl::CommandQueue OpenclExecutor::command_queue() { return *command_queue_; }
+ 
+ std::shared_ptr<Tuner<uint32_t>> OpenclExecutor::tuner() {
+   return opencl_context_->opencl_tuner();
+diff --git a/mace/runtimes/opencl/core/opencl_executor.h b/mace/runtimes/opencl/core/opencl_executor.h
+index b844c71..6e56bf4 100644
+--- a/mace/runtimes/opencl/core/opencl_executor.h
++++ b/mace/runtimes/opencl/core/opencl_executor.h
+@@ -84,7 +84,8 @@ class OpenclExecutor {
+   void SetOpenclContext(std::shared_ptr<OpenclContext> opencl_context);
+   cl::Context &context();
+   cl::Device &device();
+-  cl::CommandQueue &command_queue();
++  // Warning: don't use cl::CommandQueue&, will lead lower perf on MTK GPU.
++  cl::CommandQueue command_queue();
+   GPUType gpu_type() const;
+   const std::string platform_info() const;
+   uint64_t device_global_mem_cache_size() const;
+diff --git a/mace/runtimes/opencl/opencl_ref_runtime.cc b/mace/runtimes/opencl/opencl_ref_runtime.cc
+index 504988f..16eb43f 100644
+--- a/mace/runtimes/opencl/opencl_ref_runtime.cc
++++ b/mace/runtimes/opencl/opencl_ref_runtime.cc
+@@ -42,7 +42,7 @@ MaceStatus OpenclRefRuntime::MapBuffer(Buffer *buffer, bool wait_for_finish) {
+   cl_int error = CL_INVALID_VALUE;
+   if (buffer->mem_type == MemoryType::GPU_BUFFER) {
+     auto cl_buffer = buffer->mutable_memory<cl::Buffer>();
+-    auto &queue = opencl_executor_->command_queue();
++    auto queue = opencl_executor_->command_queue();
+     // TODO(heliangliang) Non-blocking call
+     mapped_ptr = queue.enqueueMapBuffer(
+         *cl_buffer, CL_TRUE, CL_MAP_READ | CL_MAP_WRITE,
+@@ -81,7 +81,7 @@ MaceStatus OpenclRefRuntime::UnMapBuffer(Buffer *buffer) {
+       buffer->mem_type == MemoryType::GPU_IMAGE);
+ 
+   auto cl_buffer = buffer->mutable_memory<cl::Buffer>();
+-  auto &queue = opencl_executor_->command_queue();
++  auto queue = opencl_executor_->command_queue();
+   cl_int error = queue.enqueueUnmapMemObject(
+       *cl_buffer, buffer->mutable_data<void>(), nullptr, nullptr);
+   if (error != CL_SUCCESS) {
+diff --git a/mace/tools/mace_run.cc b/mace/tools/mace_run.cc
+index bc99909..be5dec3 100644
+--- a/mace/tools/mace_run.cc
++++ b/mace/tools/mace_run.cc
+@@ -415,6 +415,7 @@ bool RunModel(const std::string &model_name,
+ 
+     inputs[input_names[i]] = mace::MaceTensor(input_shapes[i], input_data,
+         input_data_formats[i], input_data_types[i]);
++    inputs_size[input_names[i]] = input_tensor_size;
+   }
+ 
+   for (size_t i = 0; i < output_count; ++i) {
+@@ -451,7 +452,6 @@ bool RunModel(const std::string &model_name,
+               input_data_types[i], inputs[input_names[i]].data<char>());
+         }
+         engine->Run(inputs, &outputs);
+-
+         if (!FLAGS_output_dir.empty()) {
+           for (size_t i = 0; i < output_count; ++i) {
+             std::string output_name =
