@@ -1,0 +1,397 @@
+diff --git a/mace/core/BUILD.bazel b/mace/core/BUILD.bazel
+index 6129b9f..35dcac8 100644
+--- a/mace/core/BUILD.bazel
++++ b/mace/core/BUILD.bazel
+@@ -9,6 +9,7 @@ load(
+     "apu_version_select",
+     "if_android",
+     "if_android_armv7",
++    "if_apu_enabled",
+     "if_bfloat16_enabled",
+     "if_fp16_enabled",
+     "if_neon_enabled",
+@@ -61,6 +62,8 @@ cc_library(
+         "-DMACE_ENABLE_NEON",
+     ]) + if_opencl_enabled([
+         "-DMACE_ENABLE_OPENCL",
++    ]) + if_apu_enabled([
++        "-DMACE_ENABLE_MTK_APU",
+     ]) + if_android_armv7([
+         "-mfpu=neon-fp16",
+         "-mfloat-abi=softfp",
+diff --git a/mace/core/tensor.h b/mace/core/tensor.h
+index 31c2fdb..2ebc458 100644
+--- a/mace/core/tensor.h
++++ b/mace/core/tensor.h
+@@ -61,6 +61,13 @@ namespace mace {
+ #define MACE_TYPE_ENUM_SWITCH_CASE_BFLOAT16(STATEMENTS)
+ #endif  // MACE_ENABLE_BFLOAT16
+ 
++#ifdef MACE_ENABLE_MTK_APU
++#define MACE_TYPE_ENUM_SWITCH_CASE_INT16(STATEMENTS) \
++  MACE_CASE(int16_t, MACE_SINGLE_ARG(STATEMENTS))
++#else
++#define MACE_TYPE_ENUM_SWITCH_CASE_INT16(STATEMENTS)
++#endif  // MACE_ENABLE_MTK_APU
++
+ #if MACE_ENABLE_OPENCL
+ #define MACE_TYPE_ENUM_SWITCH_CASE_OPENCL(STATEMENTS)   \
+   MACE_CASE(half, MACE_SINGLE_ARG(STATEMENTS))
+@@ -76,6 +83,7 @@ namespace mace {
+     MACE_CASE(int32_t, MACE_SINGLE_ARG(STATEMENTS))                \
+     MACE_TYPE_ENUM_SWITCH_CASE_FLOAT16(STATEMENTS)                 \
+     MACE_TYPE_ENUM_SWITCH_CASE_BFLOAT16(STATEMENTS)                \
++    MACE_TYPE_ENUM_SWITCH_CASE_INT16(STATEMENTS)                   \
+     MACE_TYPE_ENUM_SWITCH_CASE_OPENCL(STATEMENTS)                  \
+     case DT_INVALID:                                               \
+       INVALID_STATEMENTS;                                          \
+diff --git a/mace/core/types.cc b/mace/core/types.cc
+index 1a33cab..f46be92 100644
+--- a/mace/core/types.cc
++++ b/mace/core/types.cc
+@@ -64,6 +64,8 @@ size_t GetEnumTypeSize(const DataType dt) {
+       return sizeof(uint8_t);
+     case DT_INT32:
+       return sizeof(int32_t);
++    case DT_INT16:
++      return sizeof(int16_t);
+     default:
+       LOG(FATAL) << "Unsupported data type: " << dt;
+       return 0;
+diff --git a/mace/core/types.h b/mace/core/types.h
+index 3952596..407ea05 100644
+--- a/mace/core/types.h
++++ b/mace/core/types.h
+@@ -63,6 +63,9 @@ MACE_MAPPING_DATA_TYPE_AND_ENUM(float16_t, DT_FLOAT16);
+ #ifdef MACE_ENABLE_BFLOAT16
+ MACE_MAPPING_DATA_TYPE_AND_ENUM(BFloat16, DT_BFLOAT16);
+ #endif
++#ifdef MACE_ENABLE_MTK_APU
++MACE_MAPPING_DATA_TYPE_AND_ENUM(int16_t, DT_INT16);
++#endif  // MACE_ENABLE_MTK_APU
+ MACE_MAPPING_DATA_TYPE_AND_ENUM(float, DT_FLOAT);
+ MACE_MAPPING_DATA_TYPE_AND_ENUM(uint8_t, DT_UINT8);
+ MACE_MAPPING_DATA_TYPE_AND_ENUM(int32_t, DT_INT32);
+diff --git a/mace/flows/apu/apu_ref_flow.cc b/mace/flows/apu/apu_ref_flow.cc
+index 0a42d10..c2e79ac 100644
+--- a/mace/flows/apu/apu_ref_flow.cc
++++ b/mace/flows/apu/apu_ref_flow.cc
+@@ -17,6 +17,7 @@
+ 
+ #include "mace/core/flow/flow_registry.h"
+ #include "mace/runtimes/apu/apu_runtime.h"
++#include "mace/utils/transpose.h"
+ 
+ namespace mace {
+ 
+@@ -87,6 +88,112 @@ MaceStatus ApuRefFlow::GetInputTransposeDims(
+   return MaceStatus::MACE_SUCCESS;
+ }
+ 
++MaceStatus ApuRefFlow::TransposeInputByDims(
++    const MaceTensor &mace_tensor,
++    Tensor *input_tensor, const std::vector<int> &dst_dims) {
++  DataType input_dt = input_tensor->dtype();
++  bool transposed = false;
++  if (!dst_dims.empty()) {
++    if (input_dt == DataType::DT_UINT8) {
++      auto user_dt = mace_tensor.data_type();
++      MACE_CHECK(user_dt == IDT_UINT8);
++      Tensor::MappingGuard input_guard(input_tensor);
++      auto input_data = input_tensor->mutable_data<uint8_t>();
++      MACE_RETURN_IF_ERROR(ops::Transpose(
++          thread_pool_, mace_tensor.data<uint8_t>().get(),
++          mace_tensor.shape(), dst_dims, input_data));
++      transposed = true;
++    } else if (input_dt == DataType::DT_INT16) {
++      auto user_dt = mace_tensor.data_type();
++      MACE_CHECK(user_dt == IDT_INT16);
++      Tensor::MappingGuard input_guard(input_tensor);
++      auto input_data = input_tensor->mutable_data<int16_t>();
++      MACE_RETURN_IF_ERROR(ops::Transpose(
++          thread_pool_, mace_tensor.data<int16_t>().get(),
++          mace_tensor.shape(), dst_dims, input_data));
++      transposed = true;
++    }
++  } else {
++    if (input_dt == DataType::DT_UINT8) {
++      auto user_dt = mace_tensor.data_type();
++      MACE_CHECK(user_dt == IDT_UINT8);
++      Tensor::MappingGuard input_guard(input_tensor);
++      ops::CopyDataBetweenSameType(
++          thread_pool_, mace_tensor.data<uint8_t>().get(),
++          input_tensor->mutable_data<uint8_t>(), input_tensor->raw_size());
++      transposed = true;
++    } else if (input_dt == DataType::DT_INT16) {
++      auto user_dt = mace_tensor.data_type();
++      MACE_CHECK(user_dt == IDT_INT16);
++      Tensor::MappingGuard input_guard(input_tensor);
++      ops::CopyDataBetweenSameType(
++          thread_pool_, mace_tensor.data<int16_t>().get(),
++          input_tensor->mutable_data<int16_t>(), input_tensor->raw_size());
++      transposed = true;
++    }
++  }
++
++  if (!transposed) {
++    return CommonFp32Flow::TransposeInputByDims(mace_tensor, input_tensor,
++                                                dst_dims);
++  } else {
++    return MaceStatus::MACE_SUCCESS;
++  }
++}
++
++MaceStatus ApuRefFlow::TransposeOutputByDims(
++    const mace::Tensor &output_tensor,
++    MaceTensor *mace_tensor, const std::vector<int> &dst_dims) {
++  bool transposed = false;
++  auto output_dt = output_tensor.dtype();
++  if (!dst_dims.empty()) {
++    if (output_dt == DataType::DT_UINT8) {
++      auto user_dt = mace_tensor->data_type();
++      MACE_CHECK(user_dt == IDT_UINT8);
++      Tensor::MappingGuard output_guard(&output_tensor);
++      auto output_data = output_tensor.data<uint8_t>();
++      MACE_RETURN_IF_ERROR(ops::Transpose(
++          thread_pool_, output_data, output_tensor.shape(),
++          dst_dims, mace_tensor->data<uint8_t>().get()));
++      transposed = true;
++    } else if (output_dt == DataType::DT_INT16) {
++      auto user_dt = mace_tensor->data_type();
++      MACE_CHECK(user_dt == IDT_INT16);
++      Tensor::MappingGuard output_guard(&output_tensor);
++      auto output_data = output_tensor.data<int16_t>();
++      MACE_RETURN_IF_ERROR(ops::Transpose(
++          thread_pool_, output_data, output_tensor.shape(),
++          dst_dims, mace_tensor->data<int16_t>().get()));
++      transposed = true;
++    }
++  } else {
++    if (output_dt == DataType::DT_UINT8) {
++      auto user_dt = mace_tensor->data_type();
++      MACE_CHECK(user_dt == IDT_UINT8);
++      Tensor::MappingGuard output_guard(&output_tensor);
++      ops::CopyDataBetweenSameType(
++          thread_pool_, output_tensor.data<uint8_t>(),
++          mace_tensor->data<uint8_t>().get(), output_tensor.raw_size());
++      transposed = true;
++    } else if (output_dt == DataType::DT_INT16) {
++      auto user_dt = mace_tensor->data_type();
++      MACE_CHECK(user_dt == IDT_INT16);
++      Tensor::MappingGuard output_guard(&output_tensor);
++      ops::CopyDataBetweenSameType(
++          thread_pool_, output_tensor.data<int16_t>(),
++          mace_tensor->data<int16_t>().get(), output_tensor.raw_size());
++      transposed = true;
++    }
++  }
++
++  if (!transposed) {
++    return CommonFp32Flow::TransposeOutputByDims(output_tensor, mace_tensor,
++                                                 dst_dims);
++  }
++  return MaceStatus::MACE_SUCCESS;
++}
++
++
+ void RegisterApuRefFlow(FlowRegistry *flow_registry) {
+   MACE_REGISTER_FLOW(flow_registry, RuntimeType::RT_APU,
+                      FlowSubType::FW_SUB_REF, ApuRefFlow);
+diff --git a/mace/flows/apu/apu_ref_flow.h b/mace/flows/apu/apu_ref_flow.h
+index 1c6b231..c3446f8 100644
+--- a/mace/flows/apu/apu_ref_flow.h
++++ b/mace/flows/apu/apu_ref_flow.h
+@@ -42,6 +42,12 @@ class ApuRefFlow : public CommonFp32Flow {
+       const std::pair<const std::string, MaceTensor> &input,
+       const Tensor *input_tensor, std::vector<int> *dst_dims,
+       DataFormat *data_format) override;
++  MaceStatus TransposeInputByDims(const MaceTensor &mace_tensor,
++                                  Tensor *input_tensor,
++                                  const std::vector<int> &dst_dims) override;
++  MaceStatus TransposeOutputByDims(const mace::Tensor &output_tensor,
++                                   MaceTensor *mace_tensor,
++                                   const std::vector<int> &dst_dims) override;
+ 
+  private:
+   MACE_DISABLE_COPY_AND_ASSIGN(ApuRefFlow);
+diff --git a/mace/runtimes/apu/v4/neuron_delegate_kernel.cc b/mace/runtimes/apu/v4/neuron_delegate_kernel.cc
+index 9befc71..a1e24cc 100644
+--- a/mace/runtimes/apu/v4/neuron_delegate_kernel.cc
++++ b/mace/runtimes/apu/v4/neuron_delegate_kernel.cc
+@@ -193,24 +193,32 @@ bool NeuronDelegateKernel::Eval(
+     LOG(INFO) << "Get the memory fd: " << mem_fd;
+     MACE_UNUSED(mem_fd);
+     // quantize
+-    if (input_infos_[i].data_type == DT_INT16) {
+-      quantize_util_int16_.QuantizeWithScaleAndZeropoint(
+-          (const float*)tensor->raw_data(),
+-          element_size,
+-          input_infos_[i].scale,
+-          input_infos_[i].zero_point,
+-          reinterpret_cast<int16_t*>(input_infos_[i].buf));
+-    } else if (input_infos_[i].data_type == DT_FLOAT) {
+-      std::memcpy(input_infos_[i].buf,
+-                    (const float*)tensor->raw_data(),
++    if (tensor->dtype() == DT_FLOAT) {
++      if (input_infos_[i].data_type == DT_INT16) {
++        quantize_util_int16_.QuantizeWithScaleAndZeropoint(
++            (const float *) tensor->raw_data(),
++            element_size,
++            input_infos_[i].scale,
++            input_infos_[i].zero_point,
++            reinterpret_cast<int16_t *>(input_infos_[i].buf));
++      } else if (input_infos_[i].data_type == DT_FLOAT) {
++        std::memcpy(input_infos_[i].buf,
++                    (const float *) tensor->raw_data(),
+                     byte_size);
+-    } else {
+-      quantize_util_uint8_.QuantizeWithScaleAndZeropoint(
+-          (const float*)tensor->raw_data(),
+-          element_size,
+-          input_infos_[i].scale,
+-          input_infos_[i].zero_point,
+-          input_infos_[i].buf);
++      } else {
++        quantize_util_uint8_.QuantizeWithScaleAndZeropoint(
++            (const float *) tensor->raw_data(),
++            element_size,
++            input_infos_[i].scale,
++            input_infos_[i].zero_point,
++            input_infos_[i].buf);
++      }
++    } else if (tensor->dtype() == DT_UINT8) {
++      // TODO(MTK): use uint8 data and set input
++      LOG(INFO) << "TODO: the tensor data type is DT_UINT8";
++    } else if (tensor->dtype() == DT_INT16) {
++      // TODO(MTK): use int16 data and set input
++      LOG(INFO) << "TODO: the tensor data type is DT_INT16";
+     }
+     // Set the input tensor buffers.
+     neuronapi_->NeuronExecution_setInput(execution,
+diff --git a/mace/tools/mace_run.cc b/mace/tools/mace_run.cc
+index bc99909..c787f95 100644
+--- a/mace/tools/mace_run.cc
++++ b/mace/tools/mace_run.cc
+@@ -79,6 +79,10 @@ IDataType ParseDataType(const std::string &data_type_str) {
+     return IDataType::IDT_FLOAT16;
+   } else if (data_type_str == "bfloat16") {
+     return IDataType::IDT_BFLOAT16;
++  } else if (data_type_str == "int16") {
++    return IDataType::IDT_INT16;
++  } else if (data_type_str == "uint8") {
++    return IDataType::IDT_UINT8;
+   } else {
+     return IDataType::IDT_FLOAT;
+   }
+@@ -212,6 +216,11 @@ std::shared_ptr<char> ReadInputDataFromFile(
+         nullptr, reinterpret_cast<const float *>(buffer_in.get()),
+         reinterpret_cast<BFloat16 *>(input_data.get()), tensor_size);
+ #endif  // MACE_ENABLE_BFLOAT16
++#ifdef MACE_ENABLE_MTK_APU
++  } else if (input_data_type == IDT_INT16 || input_data_type == IDT_UINT8) {
++    mace::ops::CopyDataBetweenSameType(
++        nullptr, buffer_in.get(), input_data.get(), input_size);
++#endif  // MACE_ENABLE_MTK_APU
+   } else {
+     LOG(FATAL) << "Input data type " << input_data_type << " is not supported.";
+   }
+diff --git a/micro/third_party/CMSIS_5 b/micro/third_party/CMSIS_5
+--- a/micro/third_party/CMSIS_5
++++ b/micro/third_party/CMSIS_5
+@@ -1 +1 @@
+-Subproject commit 378acfb6490a82ba90e1ffb4bfd4e602668b180a
++Subproject commit 378acfb6490a82ba90e1ffb4bfd4e602668b180a-dirty
+diff --git a/micro/third_party/googletest b/micro/third_party/googletest
+--- a/micro/third_party/googletest
++++ b/micro/third_party/googletest
+@@ -1 +1 @@
+-Subproject commit e6e2d3b7614ff4e6017d8968bd4c3f579133666e
++Subproject commit e6e2d3b7614ff4e6017d8968bd4c3f579133666e-dirty
+diff --git a/tools/converter.py b/tools/converter.py
+index fd54d9a..a562288 100644
+--- a/tools/converter.py
++++ b/tools/converter.py
+@@ -80,6 +80,8 @@ InOutDataTypeStrs = [
+     "float32",
+     "float16",
+     "bfloat16",
++    "int16",
++    "uint8",
+ ]
+ 
+ InOutDataType = Enum('InputDataType',
+diff --git a/tools/generate_data.py b/tools/generate_data.py
+index d4fa8db..5dd396e 100644
+--- a/tools/generate_data.py
++++ b/tools/generate_data.py
+@@ -40,6 +40,10 @@ def generate_data(name, shape, input_file, tensor_range, input_data_type):
+         np_data_type = np.float32
+     elif input_data_type == 'int32':
+         np_data_type = np.int32
++    elif input_data_type == 'int16':
++        np_data_type = np.int16
++    elif input_data_type == 'uint8':
++        np_data_type = np.uint8
+     data.astype(np_data_type).tofile(input_file_name)
+ 
+ 
+diff --git a/tools/python/transform/apu_converter.py b/tools/python/transform/apu_converter.py
+index 39516d0..70d403c 100644
+--- a/tools/python/transform/apu_converter.py
++++ b/tools/python/transform/apu_converter.py
+@@ -97,7 +97,7 @@ class ApuConverter(base_converter.ConverterInterface):
+         self.ensure_bias_vector()
+         self.ensure_binary_input()
+         self.common_check()
+-        if ConverterUtil.get_arg(self._model.op[0],
++        if ConverterUtil.get_arg(self._model,
+                                  MaceKeyword.mace_framework_type_str).i == \
+            FrameworkType.TENSORFLOW.value:
+             self.add_tensorflow_padding_value()
+@@ -157,8 +157,11 @@ class ApuConverter(base_converter.ConverterInterface):
+         for input_info in self._model.input_info:
+             mace_check(len(input_info.dims) <= 4,
+                        input_info.name + ': apu only support 1D~4D tensor')
+-            mace_check(input_info.data_type == mace_pb2.DT_FLOAT,
+-                       input_info.name + ': apu only support float input')
++            mace_check(input_info.data_type == mace_pb2.DT_FLOAT or
++                       input_info.data_type == mace_pb2.DT_INT16 or
++                       input_info.data_type == mace_pb2.DT_UINT8,
++                       input_info.name + ': apu only support '
++                                         'float/uint8/int16 input')
+             if len(input_info.dims) == 4:
+                 mace_check(input_info.data_format == DataFormat.NHWC.value,
+                            input_info.name + ': apu only support 4D tensor'
+@@ -596,7 +599,7 @@ class ApuConverter(base_converter.ConverterInterface):
+     def use_quant_in_out(self):
+         replace_dict = {}
+         for input_info in self._model.input_info:
+-            if input_info.data_type == mace_pb2.DT_FLOAT:
++            if self._option.quantize:
+                 for op in self._model.op:
+                     if op.input[0] == input_info.name \
+                            and op.type == MaceOp.Quantize.name:
+@@ -606,7 +609,7 @@ class ApuConverter(base_converter.ConverterInterface):
+                         break
+                 self._model.op.remove(op)
+         for output_info in self._model.output_info:
+-            if output_info.data_type == mace_pb2.DT_FLOAT:
++            if self._option.quantize:
+                 for op in self._model.op:
+                     if op.output[0] == output_info.name \
+                            and op.type == MaceOp.Dequantize.name:
+diff --git a/tools/python/utils/config_parser.py b/tools/python/utils/config_parser.py
+index bdde3b3..7f85cc2 100644
+--- a/tools/python/utils/config_parser.py
++++ b/tools/python/utils/config_parser.py
+@@ -188,6 +188,10 @@ def parse_data_type(str):
+         return mace_pb2.DT_FLOAT16
+     elif str == "int32":
+         return mace_pb2.DT_INT32
++    elif str == "int16":
++        return mace_pb2.DT_INT16
++    elif str == "uint8":
++        return mace_pb2.DT_UINT8
+     else:
+         mace_check(False, "data type %s not supported" % str)
+ 
