@@ -1,0 +1,12 @@
+diff --git a/tools/python/transform/base_converter.py b/tools/python/transform/base_converter.py
+index c63f71a..0515b1a 100644
+--- a/tools/python/transform/base_converter.py
++++ b/tools/python/transform/base_converter.py
+@@ -199,7 +199,6 @@ MaceFixedDataFormatOps = [MaceOp.BatchNorm,
+                           MaceOp.SpaceToDepth,
+                           MaceOp.LpNorm,
+                           MaceOp.MVNorm,
+-                          MaceOp.MatMul,
+                           MaceOp.NonlocalReshape,
+                           MaceOp.GroupNorm,
+                           MaceOp.DetectionOutput,
